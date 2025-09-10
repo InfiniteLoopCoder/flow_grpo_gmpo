@@ -357,8 +357,9 @@ def main(_):
         # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
         # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
         # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps, # * num_train_timesteps,
     )
+
     if accelerator.distributed_type == "DEEPSPEED":
         from accelerate.state import AcceleratorState
         state = AcceleratorState()
@@ -843,6 +844,11 @@ def main(_):
         assert num_timesteps == config.sample.num_steps
 
         #################### TRAINING ####################
+        # NOTE: This section is modified for GMPO.
+        # The key change is that loss is computed once per trajectory (after the timestep loop)
+        # rather than at each timestep. This is necessary for the geometric mean calculation.
+        # You will need to adjust `config.train.gradient_accumulation_steps` in your config
+        # since the number of `backward` calls per sample has changed from `num_train_timesteps` to 1.
         for inner_epoch in range(config.train.num_inner_epochs):
             # shuffle samples along batch dimension
             perm = torch.randperm(total_batch_size, device=accelerator.device)
@@ -868,101 +874,87 @@ def main(_):
                 position=0,
                 disable=not accelerator.is_local_main_process,
             ):
-                if config.train.cfg:
-                    # concat negative prompts to sample prompts to avoid two forward passes
-                    embeds = torch.cat(
-                        [train_neg_prompt_embeds[:len(sample["prompt_embeds"])], sample["prompt_embeds"]]
-                    )
-                    pooled_embeds = torch.cat(
-                        [train_neg_pooled_prompt_embeds[:len(sample["pooled_prompt_embeds"])], sample["pooled_prompt_embeds"]]
-                    )
-                else:
-                    embeds = sample["prompt_embeds"]
-                    pooled_embeds = sample["pooled_prompt_embeds"]
+                with accelerator.accumulate(transformer):
+                    if config.train.cfg:
+                        # concat negative prompts to sample prompts to avoid two forward passes
+                        embeds = torch.cat(
+                            [train_neg_prompt_embeds[:len(sample["prompt_embeds"])], sample["prompt_embeds"]]
+                        )
+                        pooled_embeds = torch.cat(
+                            [train_neg_pooled_prompt_embeds[:len(sample["pooled_prompt_embeds"])], sample["pooled_prompt_embeds"]]
+                        )
+                    else:
+                        embeds = sample["prompt_embeds"]
+                        pooled_embeds = sample["pooled_prompt_embeds"]
 
-                train_timesteps = [step_index  for step_index in range(num_train_timesteps)]
-                for j in tqdm(
-                    train_timesteps,
-                    desc="Timestep",
-                    position=1,
-                    leave=False,
-                    disable=not accelerator.is_local_main_process,
-                ):
-                    with accelerator.accumulate(transformer):
+                    # First, collect log_probs and KL losses for the entire trajectory
+                    log_probs_list = []
+                    kl_losses = []
+                    
+                    # This loop performs forward passes to get data for the whole trajectory
+                    for j in range(num_train_timesteps):
                         with autocast():
-                            prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                            _, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                            log_probs_list.append(log_prob)
+
                             if config.train.beta > 0:
                                 with torch.no_grad():
                                     with transformer.module.disable_adapter():
                                         _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, embeds, pooled_embeds, config)
+                                
+                                kl_loss_j = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2,3)) / (2 * std_dev_t ** 2)
+                                kl_losses.append(kl_loss_j)
 
-                        # grpo logic
-                        advantages = torch.clamp(
-                            sample["advantages"][:, j],
-                            -config.train.adv_clip_max,
-                            config.train.adv_clip_max,
-                        )
-                        ratio = torch.exp(log_prob - sample["log_probs"][:, j])
-                        unclipped_loss = -advantages * ratio
-                        clipped_loss = -advantages * torch.clamp(
-                            ratio,
-                            1.0 - config.train.clip_range,
-                            1.0 + config.train.clip_range,
-                        )
-                        policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
+                    # Now, compute the single GMPO loss for the batch of trajectories
+                    with autocast():
+                        current_log_probs = torch.stack(log_probs_list, dim=1)
+                        old_log_probs = sample["log_probs"][:, :num_train_timesteps]
+                        
+                        # Advantage is the same for all timesteps in a trajectory
+                        advantage = sample["advantages"][:, 0]
+
+                        # --- GMPO loss calculation based on Algorithm 1 from the paper ---
+                        sgn_A = torch.sign(advantage).unsqueeze(-1)
+                        log_ratio = current_log_probs - old_log_probs
+                        
+                        # Epsilon from the paper, used in log-space. E.g., 0.4 for a range of (e^-0.4, e^0.4)
+                        epsilon = config.train.clip_range
+                        
+                        sgn_A_log_ratio = sgn_A * log_ratio
+                        clipped_sgn_A_log_ratio = torch.clamp(sgn_A_log_ratio, -epsilon, epsilon)
+                        min_sgn_A_log_ratio = torch.min(sgn_A_log_ratio, clipped_sgn_A_log_ratio)
+                        min_log_ratio = sgn_A * min_sgn_A_log_ratio
+                        
+                        # Geometric mean of ratios in log space is arithmetic mean of log ratios
+                        mean_log_ratio = min_log_ratio.mean(dim=1)
+                        final_ratio = torch.exp(mean_log_ratio)
+
+                        policy_loss = -torch.mean(advantage * final_ratio)
+                        
                         if config.train.beta > 0:
-                            kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
-                            kl_loss = torch.mean(kl_loss)
+                            kl_loss = torch.mean(torch.stack(kl_losses))
                             loss = policy_loss + config.train.beta * kl_loss
+                            info["kl_loss"].append(kl_loss)
                         else:
                             loss = policy_loss
+                    
+                    # Store info for logging
+                    info["policy_loss"].append(policy_loss)
+                    info["loss"].append(loss)
+                    info["approx_kl"].append(0.5 * torch.mean(log_ratio**2))
+                    info["clipfrac"].append(torch.mean((torch.abs(sgn_A_log_ratio) > epsilon).float()))
 
-                        info["approx_kl"].append(
-                            0.5
-                            * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
+                    # Backward pass on the trajectory-wise loss
+                    accelerator.backward(loss)
+                    
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(
+                            transformer.parameters(), config.train.max_grad_norm
                         )
-                        info["clipfrac"].append(
-                            torch.mean(
-                                (
-                                    torch.abs(ratio - 1.0) > config.train.clip_range
-                                ).float()
-                            )
-                        )
-                        info["clipfrac_gt_one"].append(
-                            torch.mean(
-                                (
-                                    ratio - 1.0 > config.train.clip_range
-                                ).float()
-                            )
-                        )
-                        info["clipfrac_lt_one"].append(
-                            torch.mean(
-                                (
-                                    1.0 - ratio > config.train.clip_range
-                                ).float()
-                            )
-                        )
-                        info["policy_loss"].append(policy_loss)
-                        if config.train.beta > 0:
-                            info["kl_loss"].append(kl_loss)
-
-                        info["loss"].append(loss)
-
-                        # backward pass
-                        accelerator.backward(loss)
-                        if accelerator.sync_gradients:
-                            accelerator.clip_grad_norm_(
-                                transformer.parameters(), config.train.max_grad_norm
-                            )
                         optimizer.step()
                         optimizer.zero_grad()
 
-                    # Checks if the accelerator has performed an optimization step behind the scenes
-                    if accelerator.sync_gradients:
-                        # assert (j == train_timesteps[-1]) and (
-                        #     i + 1
-                        # ) % config.train.gradient_accumulation_steps == 0
-                        # log training-related stuff
+                        # Log training-related stuff
                         info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
                         info = accelerator.reduce(info, reduction="mean")
                         info.update({"epoch": epoch, "inner_epoch": inner_epoch})
@@ -970,6 +962,7 @@ def main(_):
                             wandb.log(info, step=global_step)
                         global_step += 1
                         info = defaultdict(list)
+                
                 if config.train.ema:
                     ema.step(transformer_trainable_parameters, global_step)
             # make sure we did an optimization step at the end of the inner epoch

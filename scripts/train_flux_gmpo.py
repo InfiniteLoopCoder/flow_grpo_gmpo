@@ -7,24 +7,24 @@ import time
 import json
 import hashlib
 from absl import app, flags
+from accelerate import Accelerator
 from ml_collections import config_flags
-import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.utils.data.distributed import DistributedSampler
-import logging
-
-# Setup logger
-logger = logging.getLogger(__name__)
-from diffusers import DiffusionPipeline, QwenImageTransformer2DModel
+from accelerate.utils import set_seed, ProjectConfiguration
+from accelerate.logging import get_logger
+from diffusers import FluxPipeline
 from diffusers.utils.torch_utils import is_compiled_module
-
-from flow_grpo.fsdp_utils import FSDPConfig, fsdp_wrapper, init_distributed, save_fsdp_checkpoint, OptimizerOffload
+from transformers.integrations.deepspeed import (
+    is_deepspeed_zero3_enabled,
+    set_hf_deepspeed_config,
+    unset_hf_deepspeed_config,
+)
 import numpy as np
 import flow_grpo.prompts
 import flow_grpo.rewards
 from flow_grpo.stat_tracking import PerPromptStatTracker
-from flow_grpo.diffusers_patch.qwenimage_pipeline_with_logprob import pipeline_with_logprob
+from flow_grpo.diffusers_patch.flux_pipeline_with_logprob import pipeline_with_logprob
 from flow_grpo.diffusers_patch.sd3_sde_with_logprob import sde_step_with_logprob
+from flow_grpo.diffusers_patch.train_dreambooth_lora_flux import encode_prompt
 import torch
 import wandb
 from functools import partial
@@ -41,31 +41,13 @@ tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 FLAGS = flags.FLAGS
 config_flags.DEFINE_config_file("config", "config/base.py", "Training configuration.")
 
-def gather_tensor(tensor, world_size):
-    if world_size == 1:
-        return tensor
-    
-    gather_list = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gather_list, tensor)
-    return torch.cat(gather_list)
-
-def set_seed(seed, device_specific=True):
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if device_specific and torch.cuda.is_available():
-        # For device-specific seeding
-        torch.cuda.manual_seed_all(seed + dist.get_rank() if dist.is_initialized() else seed)
+logger = get_logger(__name__)
 
 class TextPromptDataset(Dataset):
     def __init__(self, dataset, split='train'):
         self.file_path = os.path.join(dataset, f'{split}.txt')
         with open(self.file_path, 'r') as f:
             self.prompts = [line.strip() for line in f.readlines()]
-        # qwen image比较大，为了速度，测试时只取512个样本
-        if split == 'test' and dataset=='pickscore':
-            self.prompts = self.prompts[:512]
         
     def __len__(self):
         return len(self.prompts)
@@ -201,38 +183,31 @@ def create_generator(prompts, base_seed):
     return generators
 
         
-def compute_log_prob(transformer, pipeline, sample, j, config, rank):
-    img_shapes = [[(1, config.resolution // pipeline.vae_scale_factor // 2, config.resolution // pipeline.vae_scale_factor // 2)]] * len(sample["latents"][:, j])
-    txt_seq_lens = sample["prompt_embeds_mask"].sum(dim=1).tolist()
-    negative_txt_seq_lens = sample["negative_prompt_embeds_mask"].sum(dim=1).tolist()
+def compute_log_prob(transformer, pipeline, sample, j, config):
+    packed_noisy_model_input = sample["latents"][:, j]
+    device = packed_noisy_model_input.device
+    dtype = packed_noisy_model_input.dtype
+    if transformer.module.config.guidance_embeds:
+        guidance = torch.tensor([config.sample.guidance_scale], device=device)
+        guidance = guidance.expand(packed_noisy_model_input.shape[0])
+    else:
+        guidance = None
 
     # Predict the noise residual
-    # txt_seq_lens是最长的,sample["prompt_embeds_mask"]和sample["prompt_embeds"]可能有没必要的padding
-    sample["prompt_embeds_mask"] = sample["prompt_embeds_mask"][:, :max(txt_seq_lens+negative_txt_seq_lens)]
-    sample["negative_prompt_embeds_mask"] = sample["negative_prompt_embeds_mask"][:, :max(txt_seq_lens+negative_txt_seq_lens)]
-    sample["prompt_embeds"] = sample["prompt_embeds"][:, :max(txt_seq_lens+negative_txt_seq_lens)]
-    sample["negative_prompt_embeds"] = sample["negative_prompt_embeds"][:, :max(txt_seq_lens+negative_txt_seq_lens)]
-
-
-    noise_pred = transformer(
-        hidden_states=torch.cat([sample["latents"][:, j], sample["latents"][:, j]], dim=0),
-        timestep=torch.cat([sample["timesteps"][:, j], sample["timesteps"][:, j]], dim=0) / 1000,
-        guidance=None,
-        encoder_hidden_states_mask=torch.cat([sample["prompt_embeds_mask"], sample["negative_prompt_embeds_mask"]], dim=0),
-        encoder_hidden_states=torch.cat([sample["prompt_embeds"], sample["negative_prompt_embeds"]], dim=0),
-        img_shapes=img_shapes*2,
-        txt_seq_lens=txt_seq_lens+negative_txt_seq_lens,
+    model_pred = transformer(
+        hidden_states=packed_noisy_model_input,
+        timestep=sample["timesteps"][:, j] / 1000,
+        guidance=guidance,
+        pooled_projections=sample["pooled_prompt_embeds"],
+        encoder_hidden_states=sample["prompt_embeds"],
+        txt_ids= torch.zeros(sample["prompt_embeds"].shape[1], 3).to(device=device, dtype=dtype),
+        img_ids=sample["image_ids"][0],
+        return_dict=False,
     )[0]
-    noise_pred, neg_noise_pred = noise_pred.chunk(2, dim=0)
-    comb_pred = neg_noise_pred + config.sample.guidance_scale * (noise_pred - neg_noise_pred)
-
-    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-    noise_pred = comb_pred * (cond_norm / noise_norm)
     # compute the log prob of next_latents given latents under the current model
     prev_sample, log_prob, prev_sample_mean, std_dev_t = sde_step_with_logprob(
         pipeline.scheduler,
-        noise_pred.float(),
+        model_pred.float(),
         sample["timesteps"][:, j],
         sample["latents"][:, j].float(),
         prev_sample=sample["next_latents"][:, j].float(),
@@ -241,62 +216,69 @@ def compute_log_prob(transformer, pipeline, sample, j, config, rank):
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t
 
-def eval(pipeline, test_dataloader, config, rank, local_rank, world_size, device, global_step, reward_fn, executor, autocast, ema, transformer_trainable_parameters):
+def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters):
     if config.train.ema:
         ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
 
+    # test_dataloader = itertools.islice(test_dataloader, 2)
     all_rewards = defaultdict(list)
     for test_batch in tqdm(
             test_dataloader,
             desc="Eval: ",
-            disable=local_rank != 0,
+            disable=not accelerator.is_local_main_process,
             position=0,
         ):
         prompts, prompt_metadata = test_batch
+        prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
+            prompts, 
+            text_encoders, 
+            tokenizers, 
+            max_sequence_length=128, 
+            device=accelerator.device
+        )
         with autocast():
             with torch.no_grad():
-                collected_data = pipeline_with_logprob(
-                        pipeline,
-                        prompts,
-                        negative_prompt=[" "]*len(prompts),
-                        num_inference_steps=config.sample.eval_num_steps,
-                        true_cfg_scale=config.sample.guidance_scale,
-                        output_type="pt",
-                        height=config.resolution,
-                        width=config.resolution, 
-                        noise_level=0,
-                        sde_window_size=0,
+                images, _, _, _, _ = pipeline_with_logprob(
+                    pipeline,
+                    prompt_embeds=prompt_embeds,
+                    pooled_prompt_embeds=pooled_prompt_embeds,
+                    num_inference_steps=config.sample.eval_num_steps,
+                    guidance_scale=config.sample.guidance_scale,
+                    output_type="pt",
+                    height=config.resolution,
+                    width=config.resolution, 
+                    noise_level=0,
                 )
-        images = collected_data["images"]
         rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=False)
         # yield to to make sure reward computation starts
         time.sleep(0)
         rewards, reward_metadata = rewards.result()
 
         for key, value in rewards.items():
-            rewards_gather = gather_tensor(torch.as_tensor(value, device=device), world_size).cpu().float().numpy()
+            rewards_gather = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
             all_rewards[key].append(rewards_gather)
     
-    last_batch_images_gather = gather_tensor(torch.as_tensor(images, device=device), world_size).cpu().float().numpy()
-    last_batch_prompt_ids = pipeline.tokenizer(
+    last_batch_images_gather = accelerator.gather(torch.as_tensor(images, device=accelerator.device)).cpu().numpy()
+    last_batch_prompt_ids = tokenizers[0](
         prompts,
         padding="max_length",
         max_length=256,
         truncation=True,
         return_tensors="pt",
-    ).input_ids.to(device)
-    last_batch_prompt_ids_gather = gather_tensor(last_batch_prompt_ids, world_size).cpu().float().numpy()
+    ).input_ids.to(accelerator.device)
+    last_batch_prompt_ids_gather = accelerator.gather(last_batch_prompt_ids).cpu().numpy()
     last_batch_prompts_gather = pipeline.tokenizer.batch_decode(
         last_batch_prompt_ids_gather, skip_special_tokens=True
     )
     last_batch_rewards_gather = {}
     for key, value in rewards.items():
-        last_batch_rewards_gather[key] = gather_tensor(torch.as_tensor(value, device=device), world_size).cpu().float().numpy()
+        last_batch_rewards_gather[key] = accelerator.gather(torch.as_tensor(value, device=accelerator.device)).cpu().numpy()
 
     all_rewards = {key: np.concatenate(value) for key, value in all_rewards.items()}
-    if rank == 0:
+    if accelerator.is_main_process:
         with tempfile.TemporaryDirectory() as tmpdir:
             num_samples = min(15, len(last_batch_images_gather))
+            # sample_indices = random.sample(range(len(images)), num_samples)
             sample_indices = range(num_samples)
             for idx, index in enumerate(sample_indices):
                 image = last_batch_images_gather[index]
@@ -325,29 +307,26 @@ def eval(pipeline, test_dataloader, config, rank, local_rank, world_size, device
     if config.train.ema:
         ema.copy_temp_to(transformer_trainable_parameters)
 
+def unwrap_model(model, accelerator):
+    model = accelerator.unwrap_model(model)
+    model = model._orig_mod if is_compiled_module(model) else model
+    return model
 
-def get_transformer_layer_cls():
-    from diffusers.models.transformers.transformer_qwenimage import QwenImageTransformerBlock
-    from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import Qwen2_5_VLVisionBlock, Qwen2_5_VLDecoderLayer
-    return {
-        QwenImageTransformerBlock,
-        # QwenImageResidualBlock,
-        # QwenImageResample,
-        # QwenImageResidualBlock,
-        # QwenImageMidBlock,
-        # QwenImageAttentionBlock,
-        Qwen2_5_VLVisionBlock,
-        Qwen2_5_VLDecoderLayer
-        }
+def save_ckpt(save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config):
+    save_root = os.path.join(save_dir, "checkpoints", f"checkpoint-{global_step}")
+    save_root_lora = os.path.join(save_root, "lora")
+    os.makedirs(save_root_lora, exist_ok=True)
+    if accelerator.is_main_process:
+        if config.train.ema:
+            ema.copy_ema_to(transformer_trainable_parameters, store_temp=True)
+        unwrap_model(transformer, accelerator).save_pretrained(save_root_lora)
+        if config.train.ema:
+            ema.copy_temp_to(transformer_trainable_parameters)
 
 def main(_):
     # basic Accelerate and logging setup
     config = FLAGS.config
 
-    # Initialize distributed training
-    is_distributed, rank, world_size, local_rank = init_distributed()
-    device = torch.device(f'cuda:{local_rank}') if torch.cuda.is_available() else torch.device('cpu')
-    
     unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     if not config.run_name:
         config.run_name = unique_id
@@ -355,56 +334,79 @@ def main(_):
         config.run_name += "_" + unique_id
 
     # number of timesteps within each trajectory to train on
-    if config.sample.sde_window_size > 0:
-        num_train_timesteps = config.sample.sde_window_size
-    else:
-        num_train_timesteps = config.sample.num_steps - 1
+    num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
 
-    # Create project directory
-    project_dir = os.path.join(config.logdir, config.run_name)
-    os.makedirs(project_dir, exist_ok=True)
-    if rank == 0:
+    accelerator_config = ProjectConfiguration(
+        project_dir=os.path.join(config.logdir, config.run_name),
+        automatic_checkpoint_naming=True,
+        total_limit=config.num_checkpoint_limit,
+    )
+
+    accelerator = Accelerator(
+        # log_with="wandb",
+        mixed_precision=config.mixed_precision,
+        project_config=accelerator_config,
+        # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
+        # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
+        # the total number of optimizer steps to accumulate across.
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps, # * num_train_timesteps removed due to GMPO
+    )
+
+    if accelerator.is_main_process:
         wandb.init(
             project="flow_grpo",
             # mode="disabled"
         )
+        # accelerator.init_trackers(
+        #     project_name="flow-grpo",
+        #     config=config.to_dict(),
+        #     init_kwargs={"wandb": {"name": config.run_name}},
+        # )
     logger.info(f"\n{config}")
 
     # set seed (device_specific is very important to get different prompts on different devices)
     set_seed(config.seed, device_specific=True)
 
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora transformer) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    inference_dtype = torch.float32
-    if config.mixed_precision == "fp16":
-        inference_dtype = torch.float16
-    elif config.mixed_precision == "bf16":
-        inference_dtype = torch.bfloat16
-
     # load scheduler, tokenizer and models.
-    pipeline = DiffusionPipeline.from_pretrained(
-        config.pretrained.model, torch_dtype=inference_dtype
+    pipeline = FluxPipeline.from_pretrained(
+        config.pretrained.model,
+        low_cpu_mem_usage=False
     )
     # freeze parameters of models to save more memory
     pipeline.vae.requires_grad_(False)
     pipeline.text_encoder.requires_grad_(False)
+    pipeline.text_encoder_2.requires_grad_(False)
     pipeline.transformer.requires_grad_(not config.use_lora)
+
+    text_encoders = [pipeline.text_encoder, pipeline.text_encoder_2]
+    tokenizers = [pipeline.tokenizer, pipeline.tokenizer_2]
+
     # disable safety checker
     pipeline.safety_checker = None
     # make the progress bar nicer
     pipeline.set_progress_bar_config(
         position=1,
-        disable=local_rank != 0,
+        disable=not accelerator.is_local_main_process,
         leave=False,
         desc="Timestep",
         dynamic_ncols=True,
     )
 
+    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora transformer) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
+    inference_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        inference_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        inference_dtype = torch.bfloat16
+
     # Move vae and text_encoder to device and cast to inference_dtype
-    pipeline.vae.to(device, dtype=torch.float32)
-    pipeline.text_encoder.to(device, dtype=inference_dtype)
+    pipeline.vae.to(accelerator.device, dtype=torch.float32)
+    pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
+    pipeline.text_encoder_2.to(accelerator.device, dtype=inference_dtype)
     
-    pipeline.transformer.to(device)
+    pipeline.transformer.to(accelerator.device)
+
     if config.use_lora:
         # Set correct lora layers
         target_modules = [
@@ -416,10 +418,10 @@ def main(_):
             "attn.add_q_proj",
             "attn.add_v_proj",
             "attn.to_add_out",
-            "img_mlp.net.0.proj",
-            "img_mlp.net.2",
-            "txt_mlp.net.0.proj",
-            "txt_mlp.net.2",
+            "ff.net.0.proj",
+            "ff.net.2",
+            "ff_context.net.0.proj",
+            "ff_context.net.2",
         ]
         transformer_lora_config = LoraConfig(
             r=64,
@@ -435,41 +437,10 @@ def main(_):
             pipeline.transformer = get_peft_model(pipeline.transformer, transformer_lora_config)
     
     transformer = pipeline.transformer
-
-    # Setup FSDP configuration
-    fsdp_config = FSDPConfig(
-        sharding_strategy="FULL_SHARD",
-        backward_prefetch="BACKWARD_PRE",
-        cpu_offload=False,  # Set to True if memory is limited
-        num_replicate=1,
-        num_shard=world_size,
-        mixed_precision_dtype=inference_dtype,
-        use_activation_checkpointing=config.activation_checkpointing,
-        use_device_mesh=False, 
-    )
-    # Wrap language model with FSDP
-    transformer.cpu().to(dtype=torch.float32)
-    transformer = fsdp_wrapper(transformer, fsdp_config, get_transformer_layer_cls)
-    pipeline.transformer = transformer
-
-    if config.train.beta > 0:
-        transformer_ref = QwenImageTransformer2DModel.from_pretrained(
-            config.pretrained.model,
-            subfolder="transformer",
-            torch_dtype=inference_dtype
-        )
-        transformer_ref.eval()
-        transformer_ref.requires_grad_(False)
-        transformer_ref.cpu().to(dtype=torch.float32)
-        transformer_ref = fsdp_wrapper(transformer_ref, fsdp_config, get_transformer_layer_cls)
-
-    pipeline.text_encoder.cpu().to(dtype=torch.float32)
-    pipeline.text_encoder = fsdp_wrapper(pipeline.text_encoder, fsdp_config, get_transformer_layer_cls)
-
     transformer_trainable_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
     # This ema setting affects the previous 20 × 8 = 160 steps on average.
-    # ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=8, device=device)
-    ema = None
+    ema = EMAModuleWrapper(transformer_trainable_parameters, decay=0.9, update_step_interval=8, device=accelerator.device)
+    
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if config.allow_tf32:
@@ -496,9 +467,6 @@ def main(_):
         eps=config.train.adam_epsilon,
     )
 
-    if config.fsdp_optimizer_offload:
-        optimizer = OptimizerOffload(optimizer)
-    
     if config.prompt_fn == "general_ocr":
         train_dataset = TextPromptDataset(config.dataset, 'train')
         test_dataset = TextPromptDataset(config.dataset, 'test')
@@ -508,8 +476,8 @@ def main(_):
             dataset=train_dataset,
             batch_size=config.sample.train_batch_size,
             k=config.sample.num_image_per_prompt,
-            num_replicas=world_size,
-            rank=rank,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
             seed=42
         )
 
@@ -525,7 +493,6 @@ def main(_):
         # Create a regular DataLoader
         test_dataloader = DataLoader(
             test_dataset,
-            sampler=DistributedSampler(test_dataset, shuffle=False),
             batch_size=config.sample.test_batch_size,
             collate_fn=TextPromptDataset.collate_fn,
             shuffle=False,
@@ -540,8 +507,8 @@ def main(_):
             dataset=train_dataset,
             batch_size=config.sample.train_batch_size,
             k=config.sample.num_image_per_prompt,
-            num_replicas=world_size,
-            rank=rank,
+            num_replicas=accelerator.num_processes,
+            rank=accelerator.process_index,
             seed=42
         )
 
@@ -554,7 +521,6 @@ def main(_):
         )
         test_dataloader = DataLoader(
             test_dataset,
-            sampler=DistributedSampler(test_dataset, shuffle=False),
             batch_size=config.sample.test_batch_size,
             collate_fn=GenevalPromptDataset.collate_fn,
             shuffle=False,
@@ -571,19 +537,25 @@ def main(_):
 
     # for some reason, autocast is necessary for non-lora training but for lora training it isn't necessary and it uses
     # more memory
-    if config.mixed_precision == "fp16":
-        autocast = lambda: torch.cuda.amp.autocast(dtype=torch.float16)
-    elif config.mixed_precision == "bf16":
-        autocast = lambda: torch.cuda.amp.autocast(dtype=torch.bfloat16)
-    else:
-        autocast = contextlib.nullcontext
+    autocast = contextlib.nullcontext if config.use_lora else accelerator.autocast
+    # autocast = accelerator.autocast
 
-    # FSDP doesn't need deepspeed configuration
+    # for deepspeed zero
+    if accelerator.state.deepspeed_plugin:
+        accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = config.sample.train_batch_size
     # prepare prompt and reward fn
-    reward_fn = getattr(flow_grpo.rewards, 'multi_score')(device, config.reward_fn)
-    eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(device, config.reward_fn)
+    if is_deepspeed_zero3_enabled():
+        # Using deepspeed zero3 will cause the model parameter `weight.shape` to be empty.
+        unset_hf_deepspeed_config()
+        reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+        eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+        set_hf_deepspeed_config(accelerator.state.deepspeed_plugin.dschf)
+    else:
+        reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
+        eval_reward_fn = getattr(flow_grpo.rewards, 'multi_score')(accelerator.device, config.reward_fn)
     
-    # FSDP setup completed above
+    # Prepare everything with our `accelerator`.
+    transformer, optimizer, train_dataloader, test_dataloader = accelerator.prepare(transformer, optimizer, train_dataloader, test_dataloader)
     # executor to perform callbacks asynchronously. this is beneficial for the llava callbacks which makes a request to a
     # remote server running llava inference.
     executor = futures.ThreadPoolExecutor(max_workers=8)
@@ -591,12 +563,12 @@ def main(_):
     # Train!
     samples_per_epoch = (
         config.sample.train_batch_size
-        * world_size
+        * accelerator.num_processes
         * config.sample.num_batches_per_epoch
     )
     total_train_batch_size = (
         config.train.batch_size
-        * world_size
+        * accelerator.num_processes
         * config.train.gradient_accumulation_steps
     )
 
@@ -615,37 +587,49 @@ def main(_):
         f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}"
     )
     logger.info(f"  Number of inner epochs = {config.train.num_inner_epochs}")
+    # assert config.sample.train_batch_size >= config.train.batch_size
+    # assert config.sample.train_batch_size % config.train.batch_size == 0
+    # assert samples_per_epoch % total_train_batch_size == 0
 
     epoch = 0
     global_step = 0
     train_iter = iter(train_dataloader)
+
     while True:
         #################### EVAL ####################
         pipeline.transformer.eval()
-        if epoch % config.save_freq == 0:
-            save_fsdp_checkpoint(config.save_dir, transformer, global_step, rank)
-        if epoch % config.eval_freq == 0 and epoch > 0:
-            eval(pipeline, test_dataloader, config, rank, local_rank, world_size, device, global_step, eval_reward_fn, executor, autocast, ema, transformer_trainable_parameters)
+        if epoch % config.eval_freq == 0:
+            eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerator, global_step, eval_reward_fn, executor, autocast, num_train_timesteps, ema, transformer_trainable_parameters)
+        if epoch % config.save_freq == 0 and accelerator.is_main_process:
+            save_ckpt(config.save_dir, transformer, global_step, accelerator, ema, transformer_trainable_parameters, config)
 
-        
         #################### SAMPLING ####################
         pipeline.transformer.eval()
         samples = []
+        prompts = []
         for i in tqdm(
             range(config.sample.num_batches_per_epoch),
             desc=f"Epoch {epoch}: sampling",
-            disable=local_rank != 0,
+            disable=not accelerator.is_local_main_process,
             position=0,
         ):
             train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
             prompts, prompt_metadata = next(train_iter)
-            prompt_ids = pipeline.tokenizer(
+
+            prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
+                prompts, 
+                text_encoders, 
+                tokenizers, 
+                max_sequence_length=128, 
+                device=accelerator.device
+            )
+            prompt_ids = tokenizers[0](
                 prompts,
                 padding="max_length",
                 max_length=256,
                 truncation=True,
                 return_tensors="pt",
-            ).input_ids.to(device)
+            ).input_ids.to(accelerator.device)
 
             # sample
             if config.sample.same_latent:
@@ -654,25 +638,26 @@ def main(_):
                 generator = None
             with autocast():
                 with torch.no_grad():
-                    collected_data = pipeline_with_logprob(
+                    images, latents, image_ids, text_ids, log_probs = pipeline_with_logprob(
                         pipeline,
-                        prompts,
-                        negative_prompt=[" "]*len(prompts),
+                        prompt_embeds=prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
                         num_inference_steps=config.sample.num_steps,
-                        true_cfg_scale=config.sample.guidance_scale,
+                        guidance_scale=config.sample.guidance_scale,
                         output_type="pt",
                         height=config.resolution,
                         width=config.resolution, 
                         noise_level=config.sample.noise_level,
-                        generator=generator,
-                        sde_window_size=config.sample.sde_window_size,
-                        sde_window_range=config.sample.sde_window_range,
+                        generator=generator
                 )
 
-            latents = torch.stack(collected_data["all_latents"], dim=1) 
-            log_probs = torch.stack(collected_data["all_log_probs"], dim=1)  
-            timesteps = torch.stack(collected_data["all_timesteps"]).unsqueeze(0).repeat(config.sample.train_batch_size, 1)
-            images = collected_data["images"]
+            latents = torch.stack(latents, dim=1)  # (batch_size, num_steps + 1, 16, 96, 96)
+            log_probs = torch.stack(log_probs, dim=1)  # shape after stack (batch_size, num_steps)
+
+            timesteps = pipeline.scheduler.timesteps.repeat(
+                config.sample.train_batch_size, 1
+            )  # (batch_size, num_steps)
+
             # compute rewards asynchronously
             rewards = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
             # yield to to make sure reward computation starts
@@ -681,10 +666,9 @@ def main(_):
             samples.append(
                 {
                     "prompt_ids": prompt_ids,
-                    "prompt_embeds": collected_data["prompt_embeds"],
-                    "prompt_embeds_mask": collected_data["prompt_embeds_mask"],
-                    "negative_prompt_embeds": collected_data["negative_prompt_embeds"],
-                    "negative_prompt_embeds_mask": collected_data["negative_prompt_embeds_mask"],
+                    "prompt_embeds": prompt_embeds,
+                    "pooled_prompt_embeds": pooled_prompt_embeds,
+                    "image_ids": image_ids.unsqueeze(0).repeat(len(prompt_ids),1,1),
                     "timesteps": timesteps,
                     "latents": latents[
                         :, :-1
@@ -696,42 +680,18 @@ def main(_):
                     "rewards": rewards,
                 }
             )
-        max_prompt_embeds_len = max([sample["prompt_embeds_mask"].shape[1] for sample in samples])
-        
+
         # wait for all rewards to be computed
         for sample in tqdm(
             samples,
             desc="Waiting for rewards",
-            disable=local_rank!=0,
+            disable=not accelerator.is_local_main_process,
             position=0,
         ):
-            # pad prompt embeds and mask
-            seq_pad_len = max_prompt_embeds_len - sample["prompt_embeds"].shape[1]
-            sample["prompt_embeds"] = torch.nn.functional.pad(
-                sample["prompt_embeds"],  # [B, L, D]
-                (0, 0, 0, seq_pad_len),   # pad dim=1 (L)
-                value=0,
-            )
-            sample["prompt_embeds_mask"] = torch.nn.functional.pad(
-                sample["prompt_embeds_mask"],  # [B, L]
-                (0, seq_pad_len),              # pad dim=1 (L)
-                value=0,
-            )
-            sample["negative_prompt_embeds"] = torch.nn.functional.pad(
-                sample["negative_prompt_embeds"],  # [B, L, D]
-                (0, 0, 0, seq_pad_len),            # pad dim=1 (L)
-                value=0,
-            )
-            sample["negative_prompt_embeds_mask"] = torch.nn.functional.pad(
-                sample["negative_prompt_embeds_mask"],  # [B, L]
-                (0, seq_pad_len),                       # pad dim=1 (L)
-                value=0,
-            )
-
             rewards, reward_metadata = sample["rewards"].result()
-            # print(reward_metadata)
+            # accelerator.print(reward_metadata)
             sample["rewards"] = {
-                key: torch.as_tensor(value, device=device).float()
+                key: torch.as_tensor(value, device=accelerator.device).float()
                 for key, value in rewards.items()
             }
 
@@ -746,7 +706,7 @@ def main(_):
             for k in samples[0].keys()
         }
 
-        if epoch % 10 == 0 and rank == 0:
+        if epoch % 10 == 0 and accelerator.is_main_process:
             # this is a hack to force wandb to log the images as JPEGs instead of PNGs
             with tempfile.TemporaryDirectory() as tmpdir:
                 num_samples = min(15, len(images))
@@ -755,7 +715,7 @@ def main(_):
                 for idx, i in enumerate(sample_indices):
                     image = images[i]
                     pil = Image.fromarray(
-                        (image.cpu().float().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+                        (image.cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
                     )
                     pil = pil.resize((config.resolution, config.resolution))
                     pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
@@ -779,10 +739,10 @@ def main(_):
         # The purpose of repeating `adv` along the timestep dimension here is to make it easier to introduce timestep-dependent advantages later, such as adding a KL reward.
         samples["rewards"]["avg"] = samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
         # gather rewards across processes
-        gathered_rewards = {key: gather_tensor(value, world_size) for key, value in samples["rewards"].items()}
-        gathered_rewards = {key: value.cpu().float().numpy() for key, value in gathered_rewards.items()}
+        gathered_rewards = {key: accelerator.gather(value) for key, value in samples["rewards"].items()}
+        gathered_rewards = {key: value.cpu().numpy() for key, value in gathered_rewards.items()}
         # log rewards and images
-        if rank == 0:
+        if accelerator.is_main_process:
             wandb.log(
                 {
                     "epoch": epoch,
@@ -794,12 +754,12 @@ def main(_):
         # per-prompt mean/std tracking
         if config.per_prompt_stat_tracking:
             # gather the prompts across processes
-            prompt_ids = gather_tensor(samples["prompt_ids"], world_size).cpu().float().numpy()
+            prompt_ids = accelerator.gather(samples["prompt_ids"]).cpu().numpy()
             prompts = pipeline.tokenizer.batch_decode(
                 prompt_ids, skip_special_tokens=True
             )
             advantages = stat_tracker.update(prompts, gathered_rewards['avg'])
-            if local_rank == 0:
+            if accelerator.is_local_main_process:
                 print("len(prompts)", len(prompts))
                 print("len unique prompts", len(set(prompts)))
 
@@ -807,7 +767,7 @@ def main(_):
 
             zero_std_ratio, reward_std_mean = calculate_zero_std_ratio(prompts, gathered_rewards)
 
-            if rank == 0:
+            if accelerator.is_main_process:
                 wandb.log(
                     {
                         "group_size": group_size,
@@ -824,20 +784,25 @@ def main(_):
         # ungather advantages; we only need to keep the entries corresponding to the samples on this process
         advantages = torch.as_tensor(advantages)
         samples["advantages"] = (
-            advantages.reshape(world_size, -1, advantages.shape[-1])[rank]
-            .to(device)
+            advantages.reshape(accelerator.num_processes, -1, advantages.shape[-1])[accelerator.process_index]
+            .to(accelerator.device)
         )
-        if local_rank == 0:
+        if accelerator.is_local_main_process:
             print("advantages: ", samples["advantages"].abs().mean())
 
         del samples["rewards"]
         del samples["prompt_ids"]
 
         total_batch_size, num_timesteps = samples["timesteps"].shape
-        gradient_accumulation_steps = config.train.gradient_accumulation_steps * num_train_timesteps
+
+        assert num_timesteps == config.sample.num_steps
 
         #################### TRAINING ####################
         for inner_epoch in range(config.train.num_inner_epochs):
+            # shuffle samples along batch dimension
+            perm = torch.randperm(total_batch_size, device=accelerator.device)
+            samples = {k: v[perm] for k, v in samples.items()}
+
             # rebatch for training
             samples_batched = {
                 k: v.reshape(-1, total_batch_size//config.sample.num_batches_per_epoch, *v.shape[1:])
@@ -856,111 +821,84 @@ def main(_):
                 list(enumerate(samples_batched)),
                 desc=f"Epoch {epoch}.{inner_epoch}: training",
                 position=0,
-                disable=local_rank != 0,
+                disable=not accelerator.is_local_main_process,
             ):
-                train_timesteps = [step_index  for step_index in range(num_train_timesteps)]
-                for j in tqdm(
-                    train_timesteps,
-                    desc="Timestep",
-                    position=1,
-                    leave=False,
-                    disable=local_rank != 0,
-                ):
-                    # Manual gradient accumulation for FSDP
-                    if (i * num_train_timesteps + j + 1) % gradient_accumulation_steps == 0:
-                        should_sync = True
-                    else:
-                        should_sync = False
-                    
+                with accelerator.accumulate(transformer):
                     with autocast():
-                        prev_sample, log_prob, prev_sample_mean, std_dev_t = compute_log_prob(transformer, pipeline, sample, j, config, rank)
-                        if config.train.beta > 0:
-                            with torch.no_grad():
-                                if config.use_lora:
-                                    with transformer.module.disable_adapter():
-                                        _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer, pipeline, sample, j, config, rank)
-                                else:
-                                    _, _, prev_sample_mean_ref, _ = compute_log_prob(transformer_ref, pipeline, sample, j, config, rank)
-                    # grpo logic
-                    advantages = torch.clamp(
-                        sample["advantages"][:, j],
-                        -config.train.adv_clip_max,
-                        config.train.adv_clip_max,
-                    )
-                    ratio = torch.exp(log_prob - sample["log_probs"][:, j])
-                    print("ratio", ratio)
-                    unclipped_loss = -advantages * ratio
-                    clipped_loss = -advantages * torch.clamp(
-                        ratio,
-                        1.0 - config.train.clip_range,
-                        1.0 + config.train.clip_range,
-                    )
-                    policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                    policy_loss = policy_loss / gradient_accumulation_steps
-                    if config.train.beta > 0:
-                        kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2), keepdim=True) / (2 * std_dev_t ** 2)
-                        kl_loss = torch.mean(kl_loss)
-                        kl_loss = kl_loss / gradient_accumulation_steps
-                        loss = policy_loss + config.train.beta * kl_loss
-                    else:
+                        # 1. Compute log probabilities for all timesteps in the trajectory first.
+                        log_probs_list = []
+                        for j in range(num_train_timesteps):
+                            _, log_prob, _, _ = compute_log_prob(transformer, pipeline, sample, j, config)
+                            log_probs_list.append(log_prob)
+                        
+                        new_log_probs = torch.stack(log_probs_list, dim=1)
+                        old_log_probs = sample["log_probs"][:, :num_train_timesteps]
+
+                        # 2. GMPO loss calculation, as described in the paper (Algorithm 1) [cite: 127-143]
+                        # The paper suggests a wider clipping range, e.g., (e^-0.4, e^0.4), so epsilon=0.4[cite: 204].
+                        # Ensure your config.train.clip_range reflects this log-space value.
+                        epsilon = config.train.clip_range # e.g., 0.4 for GMPO
+
+                        # Advantages are the same across timesteps, so we take the first.
+                        advantage = sample["advantages"][:, 0]
+                        advantages_clamped = torch.clamp(
+                            advantage,
+                            -config.train.adv_clip_max,
+                            config.train.adv_clip_max,
+                        )
+
+                        sgn_A = torch.sign(advantages_clamped).unsqueeze(-1) # Add dim for broadcasting
+                        log_ratio = new_log_probs - old_log_probs
+
+                        # Clipping is performed in log-space, conditioned on the sign of the advantage [cite: 119]
+                        clipped_log_ratio = torch.clamp(sgn_A * log_ratio, min=-epsilon, max=epsilon)
+                        min_clipped_log_ratio = torch.min(sgn_A * log_ratio, clipped_log_ratio)
+                        final_log_ratio = sgn_A * min_clipped_log_ratio
+
+                        # Geometric mean of ratios is the exp of the arithmetic mean of log_ratios
+                        gm_importance_ratio = torch.exp(final_log_ratio.mean(dim=1))
+                        
+                        policy_loss = torch.mean(-advantages_clamped * gm_importance_ratio)
+                        
+                        # Note: If using KL loss (beta > 0), its calculation must also be adapted
+                        # to operate on the full trajectory's data, similar to the policy loss.
                         loss = policy_loss
+                    
+                        # 3. Log info metrics (vectorized)
+                        with torch.no_grad():
+                            info["approx_kl"].append(0.5 * torch.mean((log_ratio) ** 2))
+                            # Clip fraction is where the log_ratio, adjusted by sgn(A), exceeds the epsilon boundary
+                            clipfrac = torch.mean(((sgn_A * log_ratio) > epsilon).float())
+                            info["clipfrac"].append(clipfrac)
+                            info["loss"].append(loss)
+                            info["policy_loss"].append(policy_loss)
 
-                    info["approx_kl"].append(
-                        0.5
-                        * torch.mean((log_prob - sample["log_probs"][:, j]) ** 2)
-                    )
-                    info["clipfrac"].append(
-                        torch.mean(
-                            (
-                                torch.abs(ratio - 1.0) > config.train.clip_range
-                            ).float()
+                    # 4. Backward pass for the entire trajectory's loss
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(
+                            transformer.parameters(), config.train.max_grad_norm
                         )
-                    )
-                    info["clipfrac_gt_one"].append(
-                        torch.mean(
-                            (
-                                ratio - 1.0 > config.train.clip_range
-                            ).float()
-                        )
-                    )
-                    info["clipfrac_lt_one"].append(
-                        torch.mean(
-                            (
-                                1.0 - ratio > config.train.clip_range
-                            ).float()
-                        )
-                    )
-                    info["policy_loss"].append(policy_loss)
-                    if config.train.beta > 0:
-                        info["kl_loss"].append(kl_loss)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                    info["loss"].append(loss)
-
-                    # backward pass
-                    loss.backward()
-                    if should_sync:
-                        # Clip gradients
-                        torch.nn.utils.clip_grad_norm_(transformer.parameters(), config.train.max_grad_norm)
-                        optimizer.step()
-                        optimizer.zero_grad()
-
-                    if should_sync:
+                    # Checks if the accelerator has performed an optimization step behind the scenes
+                    if accelerator.sync_gradients:
+                        # assert (j == train_timesteps[-1]) and (
+                        #     i + 1
+                        # ) % config.train.gradient_accumulation_steps == 0
                         # log training-related stuff
                         info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
-                        # Reduce info across processes
-                        if is_distributed:
-                            for k, v in info.items():
-                                dist.all_reduce(v, op=dist.ReduceOp.SUM)
-                                info[k] = v / world_size
+                        info = accelerator.reduce(info, reduction="mean")
                         info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                        if rank == 0:
+                        if accelerator.is_main_process:
                             wandb.log(info, step=global_step)
                         global_step += 1
                         info = defaultdict(list)
                 if config.train.ema:
                     ema.step(transformer_trainable_parameters, global_step)
             # make sure we did an optimization step at the end of the inner epoch
-            # assert should_sync
+            # assert accelerator.sync_gradients
         
         epoch+=1
         

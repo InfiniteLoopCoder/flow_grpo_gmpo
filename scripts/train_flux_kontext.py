@@ -226,7 +226,6 @@ def eval(pipeline, test_dataloader, text_encoders, tokenizers, config, accelerat
             position=0,
         ):
         prompts, prompt_metadata, ref_images, _ = test_batch
-        ref_images = [ref_image.resize((config.resolution, config.resolution)) for ref_image in ref_images]
         prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
             prompts, 
             text_encoders, 
@@ -579,7 +578,6 @@ def main(_):
         ):
             train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
             prompts, prompt_metadata, ref_images, prompt_with_image_paths = next(train_iter)
-            ref_images = [ref_image.resize((config.resolution, config.resolution)) for ref_image in ref_images]
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
                 prompts, 
@@ -846,7 +844,7 @@ def main(_):
                         )
                         policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
                         if config.train.beta > 0:
-                            kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2), keepdim=True) / (2 * std_dev_t ** 2)
+                            kl_loss = ((prev_sample_mean - prev_sample_mean_ref) ** 2).mean(dim=(1,2,3), keepdim=True) / (2 * std_dev_t ** 2)
                             kl_loss = torch.mean(kl_loss)
                             loss = policy_loss + config.train.beta * kl_loss
                         else:
